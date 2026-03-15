@@ -31,6 +31,11 @@ _ARCH_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "activation": "gelu",
         "has_bias": True,
     },
+    "xlm-roberta": {
+        "norm_type": "layernorm",
+        "activation": "gelu",
+        "has_bias": True,
+    },
     "gpt2": {
         "norm_type": "layernorm",
         "activation": "gelu",
@@ -75,6 +80,12 @@ _WEIGHT_PATTERNS: Dict[str, Dict[str, Any]] = {
     "bert": {
         "embed": "bert.embeddings",
         "layer_prefix": "bert.encoder.layer.{i}",
+        "final_norm": None,
+        "lm_head": None,
+    },
+    "xlm-roberta": {
+        "embed": "roberta.embeddings",
+        "layer_prefix": "roberta.encoder.layer.{i}",
         "final_norm": None,
         "lm_head": None,
     },

@@ -70,7 +70,7 @@ def _get_device():
 
 
 try:
-    import grilly_core as _bridge
+    import grilly_core as _bridge  # C++ pybind11 Vulkan backend (optional)
     _BRIDGE = True
 except ImportError:
     _bridge = None
@@ -265,8 +265,11 @@ class _TransformerBlock:
             self.input_norm_weight = weights.get(f"{pfx}.input_layernorm.weight")
             self.post_attn_norm_weight = weights.get(f"{pfx}.post_attention_layernorm.weight")
 
-        elif self.model_type == "bert":
+        elif self.model_type in ("bert", "xlm-roberta"):
+            # Try both prefixed and unprefixed keys (export may strip "bert.")
             pfx = f"bert.encoder.layer.{i}"
+            if f"{pfx}.attention.self.query.weight" not in weights:
+                pfx = f"encoder.layer.{i}"
             self.q_weight = weights.get(f"{pfx}.attention.self.query.weight")
             self.k_weight = weights.get(f"{pfx}.attention.self.key.weight")
             self.v_weight = weights.get(f"{pfx}.attention.self.value.weight")
@@ -548,7 +551,7 @@ class _TransformerBlock:
             hidden_states = self._ffn(hidden_states)
             hidden_states = residual + hidden_states
 
-        elif self.model_type == "bert":
+        elif self.model_type in ("bert", "xlm-roberta"):
             # Post-norm architecture
             residual = hidden_states
             hidden_states = self._attention(hidden_states, attention_mask)
@@ -621,10 +624,14 @@ class GrillyModel:
         # Embedding weights
         if mt in ("llama", "mistral"):
             self._embed_tokens = weights.get("model.embed_tokens.weight")
-        elif mt == "bert":
-            self._embed_tokens = weights.get("bert.embeddings.word_embeddings.weight")
-            self._position_embeddings = weights.get(
-                "bert.embeddings.position_embeddings.weight"
+        elif mt in ("bert", "xlm-roberta"):
+            self._embed_tokens = (
+                weights.get("bert.embeddings.word_embeddings.weight")
+                or weights.get("embeddings.word_embeddings.weight")
+            )
+            self._position_embeddings = (
+                weights.get("bert.embeddings.position_embeddings.weight")
+                or weights.get("embeddings.position_embeddings.weight")
             )
         elif mt == "gpt2":
             self._embed_tokens = weights.get("wte.weight")
