@@ -35,45 +35,45 @@ class BlockCodeOps:
     # ── Construction ──────────────────────────────────────────────
 
     @staticmethod
-    def random_discrete(k: int, l: int, seed: int | None = None) -> np.ndarray:
+    def random_discrete(k: int, block_len: int, seed: int | None = None) -> np.ndarray:
         """
         Generate a random discrete block code vector (one-hot per block).
 
         Args:
             k: Number of blocks
-            l: Length of each block
+            block_len: Length of each block
             seed: Optional RNG seed
 
         Returns:
-            Block code vector of shape (k, l) with exactly one 1.0 per block
+            Block code vector of shape (k, block_len) with exactly one 1.0 per block
         """
         rng = np.random.default_rng(seed)
-        v = np.zeros((k, l), dtype=np.float32)
+        v = np.zeros((k, block_len), dtype=np.float32)
         for block in range(k):
-            v[block, rng.integers(0, l)] = 1.0
+            v[block, rng.integers(0, block_len)] = 1.0
         return v
 
     @staticmethod
-    def random_continuous(k: int, l: int, seed: int | None = None) -> np.ndarray:
+    def random_continuous(k: int, block_len: int, seed: int | None = None) -> np.ndarray:
         """
         Generate a random continuous block code vector (softmax per block).
 
         Args:
             k: Number of blocks
-            l: Length of each block
+            block_len: Length of each block
             seed: Optional RNG seed
 
         Returns:
-            Block code vector of shape (k, l) with each block summing to ~1
+            Block code vector of shape (k, block_len) with each block summing to ~1
         """
         rng = np.random.default_rng(seed)
-        logits = rng.standard_normal((k, l)).astype(np.float32)
+        logits = rng.standard_normal((k, block_len)).astype(np.float32)
         # softmax per block
         exp = np.exp(logits - logits.max(axis=1, keepdims=True))
         return exp / exp.sum(axis=1, keepdims=True)
 
     @staticmethod
-    def zero_vector(k: int, l: int) -> np.ndarray:
+    def zero_vector(k: int, block_len: int) -> np.ndarray:
         """
         Generate the zero/identity element: first position hot in each block.
 
@@ -81,40 +81,40 @@ class BlockCodeOps:
 
         Args:
             k: Number of blocks
-            l: Length of each block
+            block_len: Length of each block
 
         Returns:
-            Identity block code of shape (k, l)
+            Identity block code of shape (k, block_len)
         """
-        v = np.zeros((k, l), dtype=np.float32)
+        v = np.zeros((k, block_len), dtype=np.float32)
         v[:, 0] = 1.0
         return v
 
     @staticmethod
     def codebook_discrete(
-        k: int, l: int, n: int, seed: int | None = None, orthogonal: bool = True
+        k: int, block_len: int, n: int, seed: int | None = None, orthogonal: bool = True
     ) -> np.ndarray:
         """
         Generate a codebook of n discrete block code vectors.
 
         If orthogonal=True (default), generates via successive binding from a
         seed element, ensuring algebraic closure and collision-free codes
-        (IBM NVSA method). Falls back to random sampling if n > l (block length).
+        (IBM NVSA method). Falls back to random sampling if n > block_len.
 
         Args:
             k: Number of blocks
-            l: Length of each block
+            block_len: Length of each block
             n: Number of codebook entries
             seed: Optional RNG seed
             orthogonal: If True, use successive binding for orthogonality
 
         Returns:
-            Codebook of shape (n, k, l)
+            Codebook of shape (n, k, block_len)
         """
         rng = np.random.default_rng(seed)
-        codebook = np.zeros((n, k, l), dtype=np.float32)
+        codebook = np.zeros((n, k, block_len), dtype=np.float32)
 
-        if orthogonal and n <= l:
+        if orthogonal and n <= block_len:
             # IBM method: zero vector + seed + successive bindings
             # Entry 0: identity (first position hot)
             codebook[0, :, 0] = 1.0
@@ -122,7 +122,7 @@ class BlockCodeOps:
             if n > 1:
                 # Entry 1: random one-hot per block (not position 0)
                 for block in range(k):
-                    idx = rng.integers(1, l)
+                    idx = rng.integers(1, block_len)
                     codebook[1, block, idx] = 1.0
 
                 # Remaining entries: successive binding with entry 1
@@ -132,7 +132,7 @@ class BlockCodeOps:
             # Random sampling (may have collisions for large n)
             for i in range(n):
                 for block in range(k):
-                    codebook[i, block, rng.integers(0, l)] = 1.0
+                    codebook[i, block, rng.integers(0, block_len)] = 1.0
 
         return codebook
 
@@ -333,17 +333,17 @@ class BlockCodeOps:
         Returns:
             Weighted vector (k, l) or (batch, k, l)
         """
-        n, k, l = codebook.shape
+        n, k, block_len = codebook.shape
         pmf = np.asarray(pmf, dtype=np.float32)
 
         if pmf.ndim == 1:
             # (n,) @ (n, k*l) -> (k*l,) -> (k, l)
             cb_flat = codebook.reshape(n, -1)
-            return (pmf @ cb_flat).reshape(k, l).astype(np.float32)
+            return (pmf @ cb_flat).reshape(k, block_len).astype(np.float32)
         else:
-            # (batch, n) @ (n, k*l) -> (batch, k*l) -> (batch, k, l)
+            # (batch, n) @ (n, k*block_len) -> (batch, k*block_len) -> (batch, k, block_len)
             cb_flat = codebook.reshape(n, -1)
-            return (pmf @ cb_flat).reshape(-1, k, l).astype(np.float32)
+            return (pmf @ cb_flat).reshape(-1, k, block_len).astype(np.float32)
 
     @staticmethod
     def project(
@@ -430,8 +430,8 @@ class BlockCodeOps:
         d = v.shape[-1]
         if d % k != 0:
             raise ValueError(f"Dimension {d} not divisible by k={k}")
-        l = d // k
-        return v.reshape(*v.shape[:-1], k, l)
+        block_len = d // k
+        return v.reshape(*v.shape[:-1], k, block_len)
 
     @staticmethod
     def to_flat(a: np.ndarray) -> np.ndarray:

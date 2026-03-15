@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "optimum-grilly"
-version = "0.1.0"
+version = "0.2.1"
 description = "HuggingFace Optimum backend for Grilly — Vulkan GPU inference on any GPU"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     { name = "Nicolas Cloutier", email = "ncloutier@grillcheeseai.com" },
 ]
