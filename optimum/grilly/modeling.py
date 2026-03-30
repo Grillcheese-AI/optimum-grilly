@@ -10,12 +10,41 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 
 from .configuration import GrillyConfig
 from .utils import load_weights, save_weights
+
+# ---------------------------------------------------------------------------
+# HF Transformers standard output types
+# ---------------------------------------------------------------------------
+from transformers import GenerationMixin
+from transformers.modeling_outputs import (
+    BaseModelOutput,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutput,
+)
+
+# ---------------------------------------------------------------------------
+# Conditional torch import -- optimum-grilly is numpy-based; torch is only
+# used at API boundaries to return proper HF output types.
+# ---------------------------------------------------------------------------
+_torch_available = False
+try:
+    import torch
+    _torch_available = True
+except ImportError:
+    pass
+
+
+def _to_torch(x):
+    """Convert numpy array to torch.Tensor at API boundary, if torch is available."""
+    if _torch_available and x is not None:
+        return torch.from_numpy(x) if isinstance(x, np.ndarray) else x
+    return x
+
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +328,7 @@ class _TransformerBlock:
 
         elif self.model_type == "gpt2":
             pfx = f"h.{i}"
-            # GPT-2 uses HF Conv1D which stores weights as (in, out) —
+            # GPT-2 uses HF Conv1D which stores weights as (in, out) --
             # transpose to standard (out, in) convention for _linear().
             w = weights.get(f"{pfx}.attn.c_attn.weight")
             self.q_weight = w.T if w is not None else None
@@ -383,9 +412,17 @@ class _TransformerBlock:
     # ---- attention --------------------------------------------------------
 
     def _attention(
-        self, hidden_states: np.ndarray, attention_mask: Optional[np.ndarray] = None
-    ) -> np.ndarray:
-        """Multi-head (grouped query) attention with RoPE for LLaMA/Mistral."""
+        self,
+        hidden_states: np.ndarray,
+        attention_mask: Optional[np.ndarray] = None,
+        past_key_value: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        position_ids: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, np.ndarray]]]:
+        """Multi-head (grouped query) attention with RoPE for LLaMA/Mistral.
+
+        Returns (attn_output, present_key_value) where present_key_value is
+        (k, v) for KV cache support, or None for non-causal architectures.
+        """
         batch, seq_len, _ = hidden_states.shape
 
         # Project Q, K, V
@@ -405,14 +442,29 @@ class _TransformerBlock:
 
         # Apply RoPE for LLaMA / Mistral
         if self.model_type in ("llama", "mistral"):
+            # Determine position offset from past KV cache
+            past_seq_len = 0
+            if past_key_value is not None:
+                past_seq_len = past_key_value[0].shape[2]
+            total_seq_len = past_seq_len + seq_len
+
+            # Build tables covering the full range, then slice for current positions
             cos_table, sin_table = _build_rope_tables(
-                seq_len, self.head_dim, self.rope_theta
+                total_seq_len, self.head_dim, self.rope_theta
             )
+            # Slice to current token positions: [past_seq_len : total_seq_len]
+            cos_table = cos_table[past_seq_len:total_seq_len]
+            sin_table = sin_table[past_seq_len:total_seq_len]
+
             dev = _get_device()
             if dev is not None:
                 try:
-                    q_rope = _bridge.rope(dev, q, cos_table, sin_table, self.rope_theta, 1.0)
-                    k_rope = _bridge.rope(dev, k, cos_table, sin_table, self.rope_theta, 1.0)
+                    q_rope = _bridge.rope(
+                        dev, q, cos_table, sin_table, self.rope_theta, 1.0
+                    )
+                    k_rope = _bridge.rope(
+                        dev, k, cos_table, sin_table, self.rope_theta, 1.0
+                    )
                     if q_rope is not None and k_rope is not None:
                         q, k = q_rope, k_rope
                     else:
@@ -424,6 +476,19 @@ class _TransformerBlock:
             else:
                 q = _apply_rope_np(q, cos_table, sin_table)
                 k = _apply_rope_np(k, cos_table, sin_table)
+
+        # Concatenate past K/V with current K/V for KV cache
+        if past_key_value is not None:
+            k = np.concatenate([past_key_value[0], k], axis=2)
+            v = np.concatenate([past_key_value[1], v], axis=2)
+
+        # Store present KV for caching (causal models only)
+        present_key_value: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        if self.model_type in ("llama", "mistral", "gpt2"):
+            present_key_value = (k, v)
+
+        # Total key/value sequence length after concatenation
+        kv_seq_len = k.shape[2]
 
         # GQA: repeat KV heads if necessary
         if self.num_kv_heads < self.num_heads:
@@ -464,7 +529,11 @@ class _TransformerBlock:
                     scores = _bridge.attention_scores(dev, q, k, scale)
                     if scores is not None:
                         if is_causal or attention_mask is not None:
-                            mask_arg = attention_mask.astype(np.float32) if attention_mask is not None else None
+                            mask_arg = (
+                                attention_mask.astype(np.float32)
+                                if attention_mask is not None
+                                else None
+                            )
                             scores = _bridge.attention_mask(
                                 dev, scores, mask_arg, is_causal, -1e9
                             )
@@ -479,7 +548,8 @@ class _TransformerBlock:
             scores = np.einsum("bhqd,bhkd->bhqk", q, k) * scale
             if is_causal:
                 causal_mask = np.triu(
-                    np.full((seq_len, seq_len), -1e9, dtype=np.float32), k=1
+                    np.full((seq_len, kv_seq_len), -1e9, dtype=np.float32),
+                    k=kv_seq_len - seq_len + 1,
                 )
                 scores = scores + causal_mask[np.newaxis, np.newaxis, :, :]
             if attention_mask is not None:
@@ -511,7 +581,7 @@ class _TransformerBlock:
         attn_out = self._linear(
             attn_out.astype(np.float32), self.o_weight, self.o_bias
         )
-        return attn_out.astype(np.float32)
+        return attn_out.astype(np.float32), present_key_value
 
     # ---- feed-forward network ---------------------------------------------
 
@@ -532,18 +602,28 @@ class _TransformerBlock:
     # ---- forward ----------------------------------------------------------
 
     def forward(
-        self, hidden_states: np.ndarray, attention_mask: Optional[np.ndarray] = None
-    ) -> np.ndarray:
+        self,
+        hidden_states: np.ndarray,
+        attention_mask: Optional[np.ndarray] = None,
+        past_key_value: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        position_ids: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, np.ndarray]]]:
         """Full transformer block forward pass.
 
         Pre-norm for llama/mistral:  norm -> attn -> residual -> norm -> ffn -> residual
         Post-norm for bert:          attn -> residual -> norm -> ffn -> residual -> norm
+
+        Returns (hidden_states, present_key_value).
         """
+        present_key_value = None
+
         if self.model_type in ("llama", "mistral"):
             # Pre-norm architecture
             residual = hidden_states
             hidden_states = self._norm(hidden_states, self.input_norm_weight)
-            hidden_states = self._attention(hidden_states, attention_mask)
+            hidden_states, present_key_value = self._attention(
+                hidden_states, attention_mask, past_key_value, position_ids
+            )
             hidden_states = residual + hidden_states
 
             residual = hidden_states
@@ -554,7 +634,9 @@ class _TransformerBlock:
         elif self.model_type in ("bert", "xlm-roberta"):
             # Post-norm architecture
             residual = hidden_states
-            hidden_states = self._attention(hidden_states, attention_mask)
+            hidden_states, present_key_value = self._attention(
+                hidden_states, attention_mask, past_key_value, position_ids
+            )
             hidden_states = residual + hidden_states
             hidden_states = self._norm(
                 hidden_states, self.input_norm_weight, self.input_norm_bias
@@ -573,7 +655,9 @@ class _TransformerBlock:
             hidden_states = self._norm(
                 hidden_states, self.input_norm_weight, self.input_norm_bias
             )
-            hidden_states = self._attention(hidden_states, attention_mask)
+            hidden_states, present_key_value = self._attention(
+                hidden_states, attention_mask, past_key_value, position_ids
+            )
             hidden_states = residual + hidden_states
 
             residual = hidden_states
@@ -583,7 +667,7 @@ class _TransformerBlock:
             hidden_states = self._ffn(hidden_states)
             hidden_states = residual + hidden_states
 
-        return hidden_states.astype(np.float32)
+        return hidden_states.astype(np.float32), present_key_value
 
 
 # ---------------------------------------------------------------------------
@@ -725,13 +809,47 @@ class GrillyModel:
         self,
         input_ids: np.ndarray,
         attention_mask: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Embed -> transformer layers -> final norm."""
+        past_key_values: Optional[list] = None,
+        position_ids: Optional[np.ndarray] = None,
+        output_hidden_states: bool = False,
+    ) -> Tuple[np.ndarray, Optional[list], Optional[Tuple[np.ndarray, ...]]]:
+        """Embed -> transformer layers -> final norm.
+
+        Returns:
+            (hidden_states, present_key_values, all_hidden_states)
+            - present_key_values: list of (k, v) tuples per layer, or None
+            - all_hidden_states: tuple of hidden states (one per layer + embedding)
+              if output_hidden_states is True, else None
+        """
         hidden_states = self._embed(input_ids)
-        for layer in self._layers:
-            hidden_states = layer.forward(hidden_states, attention_mask)
+
+        all_hidden_states: Optional[Tuple[np.ndarray, ...]] = None
+        if output_hidden_states:
+            all_hidden_states = (hidden_states,)
+
+        present_key_values: Optional[list] = None
+        if past_key_values is not None or self.config.model_type in (
+            "llama", "mistral", "gpt2"
+        ):
+            present_key_values = []
+
+        for i, layer in enumerate(self._layers):
+            layer_past = None
+            if past_key_values is not None and i < len(past_key_values):
+                layer_past = past_key_values[i]
+
+            hidden_states, present_kv = layer.forward(
+                hidden_states, attention_mask, layer_past, position_ids
+            )
+
+            if present_key_values is not None:
+                present_key_values.append(present_kv)
+
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
         hidden_states = self._final_norm(hidden_states)
-        return hidden_states.astype(np.float32)
+        return hidden_states.astype(np.float32), present_key_values, all_hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -745,9 +863,29 @@ class GrillyModelForFeatureExtraction(GrillyModel):
         self,
         input_ids: np.ndarray,
         attention_mask: Optional[np.ndarray] = None,
-    ) -> dict:
-        hidden_states = self._encode(input_ids, attention_mask)
-        return {"last_hidden_state": hidden_states}
+        return_dict: bool = True,
+        output_hidden_states: bool = False,
+        **kwargs,
+    ) -> Union[BaseModelOutput, Tuple]:
+        hidden_states, _, all_hidden_states = self._encode(
+            input_ids, attention_mask, output_hidden_states=output_hidden_states
+        )
+
+        hidden_states_torch = _to_torch(hidden_states)
+        all_hidden_states_torch = None
+        if all_hidden_states is not None:
+            all_hidden_states_torch = tuple(_to_torch(h) for h in all_hidden_states)
+
+        if return_dict:
+            return BaseModelOutput(
+                last_hidden_state=hidden_states_torch,
+                hidden_states=all_hidden_states_torch,
+            )
+        # Tuple output
+        outputs = (hidden_states_torch,)
+        if all_hidden_states_torch is not None:
+            outputs = outputs + (all_hidden_states_torch,)
+        return outputs
 
 
 class GrillyModelForSequenceClassification(GrillyModel):
@@ -769,8 +907,14 @@ class GrillyModelForSequenceClassification(GrillyModel):
         self,
         input_ids: np.ndarray,
         attention_mask: Optional[np.ndarray] = None,
-    ) -> dict:
-        hidden_states = self._encode(input_ids, attention_mask)
+        labels: Optional[np.ndarray] = None,
+        return_dict: bool = True,
+        output_hidden_states: bool = False,
+        **kwargs,
+    ) -> Union[SequenceClassifierOutput, Tuple]:
+        hidden_states, _, all_hidden_states = self._encode(
+            input_ids, attention_mask, output_hidden_states=output_hidden_states
+        )
 
         # Pool: [CLS] for BERT, last token for causal models
         if self.config.model_type == "bert":
@@ -781,25 +925,58 @@ class GrillyModelForSequenceClassification(GrillyModel):
 
         if self._classifier_weight is not None:
             dev = _get_device()
+            logits = None
             if dev is not None:
                 try:
-                    logits = _bridge.linear(
+                    result = _bridge.linear(
                         dev, pooled, self._classifier_weight, self._classifier_bias
                     )
-                    if logits is not None:
-                        return {"logits": logits.astype(np.float32)}
+                    if result is not None:
+                        logits = result.astype(np.float32)
                 except Exception as e:
                     logger.debug("GPU op failed, falling back to CPU: %s", e)
-            logits = pooled @ self._classifier_weight.T
-            if self._classifier_bias is not None:
-                logits = logits + self._classifier_bias
-            return {"logits": logits.astype(np.float32)}
+            if logits is None:
+                logits = pooled @ self._classifier_weight.T
+                if self._classifier_bias is not None:
+                    logits = logits + self._classifier_bias
+                logits = logits.astype(np.float32)
+        else:
+            logits = pooled.astype(np.float32)
 
-        return {"logits": pooled.astype(np.float32)}
+        # Compute loss if labels are provided
+        loss = None
+        if labels is not None and _torch_available:
+            logits_t = _to_torch(logits)
+            labels_t = _to_torch(labels)
+            if labels_t.dtype in (torch.long, torch.int):
+                loss = torch.nn.functional.cross_entropy(logits_t, labels_t)
+            else:
+                loss = torch.nn.functional.mse_loss(logits_t, labels_t)
+
+        logits_torch = _to_torch(logits)
+        all_hidden_states_torch = None
+        if all_hidden_states is not None:
+            all_hidden_states_torch = tuple(_to_torch(h) for h in all_hidden_states)
+
+        if return_dict:
+            return SequenceClassifierOutput(
+                loss=loss,
+                logits=logits_torch,
+                hidden_states=all_hidden_states_torch,
+            )
+        # Tuple output
+        outputs = (logits_torch,)
+        if loss is not None:
+            outputs = (loss,) + outputs
+        if all_hidden_states_torch is not None:
+            outputs = outputs + (all_hidden_states_torch,)
+        return outputs
 
 
-class GrillyModelForCausalLM(GrillyModel):
+class GrillyModelForCausalLM(GrillyModel, GenerationMixin):
     """Causal language model with LM head for text generation."""
+
+    main_input_name = "input_ids"
 
     def __init__(self, config: GrillyConfig, weights: dict):
         super().__init__(config, weights)
@@ -835,31 +1012,183 @@ class GrillyModelForCausalLM(GrillyModel):
         self,
         input_ids: np.ndarray,
         attention_mask: Optional[np.ndarray] = None,
-    ) -> dict:
-        hidden_states = self._encode(input_ids, attention_mask)
+        past_key_values: Optional[list] = None,
+        position_ids: Optional[np.ndarray] = None,
+        labels: Optional[np.ndarray] = None,
+        return_dict: bool = True,
+        output_hidden_states: bool = False,
+        **kwargs,
+    ) -> Union[CausalLMOutputWithPast, Tuple]:
+        hidden_states, present_key_values, all_hidden_states = self._encode(
+            input_ids,
+            attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            output_hidden_states=output_hidden_states,
+        )
         logits = self._lm_head(hidden_states)
-        return {"logits": logits}
+
+        # Compute loss if labels are provided
+        loss = None
+        if labels is not None and _torch_available:
+            logits_t = _to_torch(logits)
+            labels_t = _to_torch(labels)
+            # Shift so that tokens < n predict n
+            shift_logits = logits_t[..., :-1, :].contiguous()
+            shift_labels = labels_t[..., 1:].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+
+        logits_torch = _to_torch(logits)
+        all_hidden_states_torch = None
+        if all_hidden_states is not None:
+            all_hidden_states_torch = tuple(_to_torch(h) for h in all_hidden_states)
+
+        # Convert present_key_values to torch tensors at API boundary
+        present_kv_torch = None
+        if present_key_values is not None:
+            present_kv_torch = tuple(
+                (_to_torch(kv[0]), _to_torch(kv[1]))
+                if kv is not None
+                else None
+                for kv in present_key_values
+            )
+
+        if return_dict:
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits_torch,
+                past_key_values=present_kv_torch,
+                hidden_states=all_hidden_states_torch,
+            )
+        # Tuple output
+        outputs = (logits_torch,)
+        if loss is not None:
+            outputs = (loss,) + outputs
+        if present_kv_torch is not None:
+            outputs = outputs + (present_kv_torch,)
+        if all_hidden_states_torch is not None:
+            outputs = outputs + (all_hidden_states_torch,)
+        return outputs
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        **kwargs,
+    ) -> dict:
+        """Prepare model inputs for HF generate() compatibility.
+
+        When past_key_values are provided, only pass the last token as input_ids
+        since previous tokens are already cached.
+        """
+        # Convert torch.Tensor to numpy for internal processing
+        if _torch_available and isinstance(input_ids, torch.Tensor):
+            input_ids_np = input_ids.cpu().numpy()
+        else:
+            input_ids_np = np.asarray(input_ids)
+
+        position_ids = None
+        if past_key_values is not None:
+            # Only use the last token when we have a cache
+            past_length = past_key_values[0][0].shape[2] if past_key_values[0] is not None else 0
+            input_ids_np = input_ids_np[:, -1:]
+            # Position IDs start after the cached sequence
+            position_ids = np.array([[past_length]], dtype=np.int64)
+            position_ids = np.broadcast_to(
+                position_ids, (input_ids_np.shape[0], 1)
+            ).copy()
+
+        attention_mask_np = None
+        if attention_mask is not None:
+            if _torch_available and isinstance(attention_mask, torch.Tensor):
+                attention_mask_np = attention_mask.cpu().numpy()
+            else:
+                attention_mask_np = np.asarray(attention_mask)
+
+        # Convert past_key_values from torch to numpy if needed
+        past_kv_np = None
+        if past_key_values is not None:
+            past_kv_np = []
+            for layer_past in past_key_values:
+                if layer_past is not None:
+                    k, v = layer_past
+                    if _torch_available and isinstance(k, torch.Tensor):
+                        k = k.cpu().numpy()
+                    if _torch_available and isinstance(v, torch.Tensor):
+                        v = v.cpu().numpy()
+                    past_kv_np.append((k, v))
+                else:
+                    past_kv_np.append(None)
+
+        return {
+            "input_ids": input_ids_np,
+            "attention_mask": attention_mask_np,
+            "past_key_values": past_kv_np,
+            "position_ids": position_ids,
+        }
 
     def generate(
         self,
-        input_ids: np.ndarray,
+        input_ids: Union[np.ndarray, "torch.Tensor"],
         max_new_tokens: int = 50,
         temperature: float = 1.0,
         top_k: int = 50,
-    ) -> np.ndarray:
+    ) -> Union[np.ndarray, "torch.Tensor"]:
         """Simple autoregressive generation with top-k sampling.
 
-        Note: No KV-cache — recomputes the full forward pass for each new
-        token. This is correct but O(n²) in sequence length. KV-cache
-        support is planned for a future release.
+        Accepts both numpy arrays and torch.Tensor inputs. If a torch.Tensor
+        is provided, the output will also be a torch.Tensor.
+
+        Uses KV-cache for efficient autoregressive decoding.
         """
-        ids = np.array(input_ids, dtype=np.int64)
+        # Track whether input was torch so we can return the same type
+        return_torch = False
+        if _torch_available and isinstance(input_ids, torch.Tensor):
+            return_torch = True
+            ids = input_ids.cpu().numpy().astype(np.int64)
+        else:
+            ids = np.array(input_ids, dtype=np.int64)
         if ids.ndim == 1:
             ids = ids[np.newaxis, :]
 
-        for _ in range(max_new_tokens):
-            out = self.forward(ids)
-            logits = out["logits"][:, -1, :]  # (batch, vocab)
+        past_key_values = None
+
+        for step in range(max_new_tokens):
+            if past_key_values is not None:
+                # Only feed the last token for cached generation
+                step_ids = ids[:, -1:]
+            else:
+                step_ids = ids
+
+            out = self.forward(
+                step_ids,
+                past_key_values=past_key_values,
+                return_dict=True,
+            )
+            logits = out.logits
+            # Convert back to numpy for sampling
+            if _torch_available and isinstance(logits, torch.Tensor):
+                logits = logits.cpu().numpy()
+            logits = logits[:, -1, :]  # (batch, vocab)
+
+            # Extract past_key_values (convert torch -> numpy if needed)
+            past_key_values_raw = out.past_key_values
+            if past_key_values_raw is not None:
+                past_key_values = []
+                for layer_kv in past_key_values_raw:
+                    if layer_kv is not None:
+                        k, v = layer_kv
+                        if _torch_available and isinstance(k, torch.Tensor):
+                            k = k.cpu().numpy()
+                        if _torch_available and isinstance(v, torch.Tensor):
+                            v = v.cpu().numpy()
+                        past_key_values.append((k, v))
+                    else:
+                        past_key_values.append(None)
 
             # Temperature scaling
             if temperature != 1.0:
@@ -883,4 +1212,6 @@ class GrillyModelForCausalLM(GrillyModel):
             )
             ids = np.concatenate([ids, next_token], axis=-1)
 
+        if return_torch:
+            return torch.from_numpy(ids)
         return ids
