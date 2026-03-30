@@ -228,7 +228,7 @@ class TestModeling:
 
     def test_hf_dataclass_returns(self, tmp_path: Path):
         """Verify HF-compliant return types."""
-        from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutput
+        from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPast
 
         model_dir = _create_llama_mock(tmp_path)
 

@@ -14,9 +14,6 @@ from typing import Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 
-from .configuration import GrillyConfig
-from .utils import load_weights, save_weights
-
 # ---------------------------------------------------------------------------
 # HF Transformers standard output types
 # ---------------------------------------------------------------------------
@@ -26,6 +23,9 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
     SequenceClassifierOutput,
 )
+
+from .configuration import GrillyConfig
+from .utils import load_weights, save_weights
 
 # ---------------------------------------------------------------------------
 # Conditional torch import -- optimum-grilly is numpy-based; torch is only
